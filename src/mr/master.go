@@ -6,11 +6,40 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-
 type Master struct {
 	// Your definitions here.
+	WorkingStatus     Status     // Master所处工作状态
+	FileNames         []string   // 执行任务的文件名
+	WorkingQueue      []Task     // 正在进行的任务队列
+	CurrentTaskId     int32      // 当前正在进行的任务Id
+	MapTaskChannel    chan *Task // 存放Map任务的channel
+	ReduceTaskChannel chan *Task // 存放Reduce任务的channel
 
+	NReduce int32 // 划分成多少个reduce任务
 }
+
+type Status = int32
+
+const (
+	Mapping = iota
+	Reducing
+	Done
+)
+
+type Task struct {
+	StartTime int64    // 开始执行时间戳
+	FileName  string   // 任务对应的文件名
+	TaskId    int32    // 任务号
+	Type      TaskType // 任务类型
+	NReduce   int      // reduce任务个数（用来hash）
+}
+
+type TaskType = int32
+
+const (
+	MapTask = iota
+	ReduceTask
+)
 
 // Your code here -- RPC handlers for the worker to call.
 
@@ -24,6 +53,19 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+/**
+ * 下面是暴露给worker的RPC接口
+ */
+func (m *Master) AskForTask(request *AskForTaskRequest, response *AskForTaskResponse) error {
+
+	return nil
+}
+
+func (m *Master) NotifyTaskDone(
+	request *NotifyTaskDoneRequest,
+	response *NotifyTaskDoneResponse) error {
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -49,8 +91,12 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
-
-
+	switch m.WorkingStatus {
+	case Done:
+		ret = true
+	default:
+		ret = false
+	}
 	return ret
 }
 
@@ -63,7 +109,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
 
 	// Your code here.
-
 
 	m.server()
 	return &m

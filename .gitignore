@@ -1,3 +1,6 @@
 pkg/
 api.key
 *-handin.tar.gz
+.idea/modules.xml
+.idea/6.824.iml
+.idea/vcs.xml
