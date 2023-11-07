@@ -1,6 +1,11 @@
 package mr
 
-import "log"
+import (
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
 import "net"
 import "os"
 import "net/rpc"
@@ -12,10 +17,11 @@ type Master struct {
 	FileNames         []string   // 执行任务的文件名
 	WorkingQueue      []Task     // 正在进行的任务队列
 	CurrentTaskId     int32      // 当前正在进行的任务Id
+	TaskIdMutex       sync.Mutex // 任务id自增时锁
 	MapTaskChannel    chan *Task // 存放Map任务的channel
 	ReduceTaskChannel chan *Task // 存放Reduce任务的channel
 
-	NReduce int32 // 划分成多少个reduce任务
+	NReduce int // 划分成多少个reduce任务
 }
 
 type Status = int32
@@ -39,6 +45,7 @@ type TaskType = int32
 const (
 	MapTask = iota
 	ReduceTask
+	None
 )
 
 // Your code here -- RPC handlers for the worker to call.
@@ -57,8 +64,49 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
  * 下面是暴露给worker的RPC接口
  */
 func (m *Master) AskForTask(request *AskForTaskRequest, response *AskForTaskResponse) error {
+	fmt.Println("receive ask for task from worker...")
+	var task Task
+	switch m.WorkingStatus {
+	case Mapping:
+		task, _ = m.processMappingTask()
+	case Reducing:
+		task, _ = m.processReducingTask()
+	case Done:
+		task = Task{Type: None}
+	}
 
+	response.Task = task
+	fmt.Println("the task is: ", response.Task)
 	return nil
+}
+
+func (m *Master) processMappingTask() (Task, error) {
+	task := <-m.MapTaskChannel
+	(*task).TaskId = m.generateTaskId()
+	(*task).StartTime = m.generateStartTime()
+	(*task).Type = MapTask
+	(*task).NReduce = m.NReduce
+	return *task, nil
+}
+
+func (m *Master) generateTaskId() int32 {
+	var taskId int32
+
+	m.TaskIdMutex.Lock()
+	taskId = m.CurrentTaskId
+	m.CurrentTaskId++
+	m.TaskIdMutex.Unlock()
+
+	return taskId
+}
+
+func (m *Master) generateStartTime() int64 {
+	now := time.Now()
+	return now.Unix()
+}
+
+func (m *Master) processReducingTask() (Task, error) {
+	return Task{}, nil
 }
 
 func (m *Master) NotifyTaskDone(
@@ -106,7 +154,21 @@ func (m *Master) Done() bool {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+	var nMap = len(files) // Map任务个数
+	m := Master{
+		WorkingStatus:     Mapping,
+		FileNames:         files,
+		WorkingQueue:      make([]Task, nMap),
+		CurrentTaskId:     0,
+		MapTaskChannel:    make(chan *Task, nMap),
+		ReduceTaskChannel: make(chan *Task, nReduce),
+		NReduce:           nReduce,
+	}
+
+	for _, file := range files {
+		var task = Task{FileName: file}
+		m.MapTaskChannel <- &task
+	}
 
 	// Your code here.
 

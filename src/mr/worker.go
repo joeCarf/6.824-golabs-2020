@@ -17,6 +17,7 @@ type AskForTaskRequest struct {
 }
 
 type AskForTaskResponse struct {
+	Task Task
 }
 
 type NotifyTaskDoneRequest struct {
@@ -42,7 +43,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-
+	request := AskForTaskRequest{}
+	response := AskForTaskResponse{}
+	call("Master.AskForTask", &request, &response)
+	fmt.Println(response.Task)
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
