@@ -1,6 +1,12 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"strconv"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -21,10 +27,14 @@ type AskForTaskResponse struct {
 }
 
 type NotifyTaskDoneRequest struct {
+	TaskId   int
+	TaskType TaskType
 }
 
 type NotifyTaskDoneResponse struct {
 }
+
+const intermediateFilePrefix string = "mr-in-"
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -43,13 +53,70 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	request := AskForTaskRequest{}
-	response := AskForTaskResponse{}
-	call("Master.AskForTask", &request, &response)
-	fmt.Println(response.Task)
+	for {
+		request := AskForTaskRequest{}
+		response := AskForTaskResponse{}
+		call("Master.AskForTask", &request, &response)
+		switch response.Task.Type {
+		case MapTask:
+			doMappingTask(mapf, &(response.Task))
+			sendTaskDoneMessage(int(response.Task.TaskId), MapTask)
+		case ReduceTask:
+			doReducingTask(reducef, &(response.Task))
+		case None:
+			return
+		}
+	}
+
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
 
+}
+
+func doMappingTask(mapf func(string, string) []KeyValue, task *Task) {
+	intermediate := []KeyValue{}
+	filename := task.FileName
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+	kva := mapf(filename, string(content))
+	intermediate = append(intermediate, kva...)
+
+	HashedKV := make([][]KeyValue, task.NReduce)
+
+	for _, kv := range intermediate {
+		index := ihash(kv.Key) % task.NReduce
+		HashedKV[index] = append(HashedKV[index], kv)
+	}
+
+	for i := 0; i < task.NReduce; i++ {
+		intermediateFileName := intermediateFilePrefix + strconv.Itoa(int(task.TaskId)) + "-" + strconv.Itoa(i)
+		infile, _ := os.Create(intermediateFileName)
+		enc := json.NewEncoder(infile)
+		for _, kv := range HashedKV[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatalf("err when encoding file %v", intermediateFileName)
+			}
+		}
+	}
+
+}
+
+func doReducingTask(reducef func(string, []string) string, task *Task) {
+	fmt.Println("received reduce task is: ", task)
+}
+
+func sendTaskDoneMessage(taskId int, taskType TaskType) {
+	request := NotifyTaskDoneRequest{TaskId: taskId, TaskType: taskType}
+	response := NotifyTaskDoneRequest{}
+	call("Master.NotifyTaskDone", &request, &response)
 }
 
 //

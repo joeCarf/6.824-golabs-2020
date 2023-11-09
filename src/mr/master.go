@@ -13,15 +13,33 @@ import "net/http"
 
 type Master struct {
 	// Your definitions here.
-	WorkingStatus     Status     // Master所处工作状态
-	FileNames         []string   // 执行任务的文件名
-	WorkingQueue      []Task     // 正在进行的任务队列
-	CurrentTaskId     int32      // 当前正在进行的任务Id
-	TaskIdMutex       sync.Mutex // 任务id自增时锁
-	MapTaskChannel    chan *Task // 存放Map任务的channel
-	ReduceTaskChannel chan *Task // 存放Reduce任务的channel
+	WorkingStatus      Status       // Master所处工作状态
+	FileNames          []string     // 执行任务的文件名
+	MapWorkingQueue    WorkingQueue // 正在进行的Map任务队列
+	ReduceWorkingQueue WorkingQueue // 正在进行的Reduce任务队列
+	CurrentTaskId      int32        // 当前正在进行的任务Id
+	TaskIdMutex        sync.Mutex   // 任务id自增时锁
+	MapTaskChannel     chan *Task   // 存放Map任务的channel
+	ReduceTaskChannel  chan *Task   // 存放Reduce任务的channel
 
 	NReduce int // 划分成多少个reduce任务
+}
+
+type WorkingQueue struct {
+	Queue map[int]Task
+	mu    sync.Mutex
+}
+
+func (wq *WorkingQueue) removeTaskById(taskId int) {
+	wq.mu.Lock()
+	delete(wq.Queue, taskId)
+	wq.mu.Unlock()
+}
+
+func (wq *WorkingQueue) putTask(taskId int, task Task) {
+	wq.mu.Lock()
+	wq.Queue[taskId] = task
+	wq.mu.Unlock()
 }
 
 type Status = int32
@@ -64,7 +82,6 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
  * 下面是暴露给worker的RPC接口
  */
 func (m *Master) AskForTask(request *AskForTaskRequest, response *AskForTaskResponse) error {
-	fmt.Println("receive ask for task from worker...")
 	var task Task
 	switch m.WorkingStatus {
 	case Mapping:
@@ -76,16 +93,38 @@ func (m *Master) AskForTask(request *AskForTaskRequest, response *AskForTaskResp
 	}
 
 	response.Task = task
-	fmt.Println("the task is: ", response.Task)
+	fmt.Println("the returned task is: ", response.Task)
+	return nil
+}
+
+func (m *Master) NotifyTaskDone(
+	request *NotifyTaskDoneRequest,
+	response *NotifyTaskDoneResponse) error {
+
+	if request.TaskType == MapTask {
+		m.MapWorkingQueue.removeTaskById(request.TaskId)
+	} else {
+		m.ReduceWorkingQueue.removeTaskById(request.TaskId)
+	}
+
+	if m.WorkingStatus == Mapping && len(m.MapTaskChannel) == 0 && len(m.MapWorkingQueue.Queue) == 0 {
+		m.WorkingStatus = Reducing
+	} else if m.WorkingStatus == Reducing && len(m.ReduceTaskChannel) == 0 && len(m.ReduceWorkingQueue.Queue) == 0 {
+		m.WorkingStatus = Done
+	}
+
 	return nil
 }
 
 func (m *Master) processMappingTask() (Task, error) {
+	fmt.Println("receive asked for mapping task from worker...")
 	task := <-m.MapTaskChannel
 	(*task).TaskId = m.generateTaskId()
 	(*task).StartTime = m.generateStartTime()
 	(*task).Type = MapTask
 	(*task).NReduce = m.NReduce
+
+	m.MapWorkingQueue.putTask(int((*task).TaskId), *task)
 	return *task, nil
 }
 
@@ -106,13 +145,9 @@ func (m *Master) generateStartTime() int64 {
 }
 
 func (m *Master) processReducingTask() (Task, error) {
-	return Task{}, nil
-}
+	fmt.Println("receive asked for reducing task from worker...")
 
-func (m *Master) NotifyTaskDone(
-	request *NotifyTaskDoneRequest,
-	response *NotifyTaskDoneResponse) error {
-	return nil
+	return Task{Type: ReduceTask}, nil
 }
 
 //
@@ -156,9 +191,14 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	var nMap = len(files) // Map任务个数
 	m := Master{
-		WorkingStatus:     Mapping,
-		FileNames:         files,
-		WorkingQueue:      make([]Task, nMap),
+		WorkingStatus: Mapping,
+		FileNames:     files,
+		MapWorkingQueue: WorkingQueue{
+			Queue: make(map[int]Task),
+		},
+		ReduceWorkingQueue: WorkingQueue{
+			Queue: make(map[int]Task),
+		},
 		CurrentTaskId:     0,
 		MapTaskChannel:    make(chan *Task, nMap),
 		ReduceTaskChannel: make(chan *Task, nReduce),
