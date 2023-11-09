@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="01522bc9-705c-4589-9af9-830983137f38" name="10.176.14.17">
+        <fileTransfer accessType="SFTP" host="10.176.14.17" port="22" sshConfigId="110d6658-306e-4f55-8731-a1560badf730" sshConfig="ubuntu@10.176.14.17:22" authAgent="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+      <webServer id="4f655dd6-2c44-4fef-acd7-466a45f30888" name="tecent cloud">
+        <fileTransfer accessType="SFTP" host="124.220.168.237" port="22" sshConfigId="b773aeed-16bd-4da0-9fa1-31fb37e44868" sshConfig="txyun" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

@@ -21,6 +21,8 @@ const (
 	dReduce logTopic = "RDCE"
 	dError  logTopic = "ERRO"
 	dLog    logTopic = "LOGS"
+	dWorker logTopic = "WORK"
+	dMaster logTopic = "MAST"
 )
 
 var debugStart time.Time

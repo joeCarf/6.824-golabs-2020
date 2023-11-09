@@ -47,6 +47,7 @@ const (
 	MapStatus MasterStatus = iota
 	ReduceStatus
 	DoneStatus
+	ExitStatus
 )
 
 //========================供worker调用的RPC处理方法=======================//
@@ -60,7 +61,11 @@ const (
 //  @return error
 //
 func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
-	//根据当前的状态, 分配任务
+	//TODO: 这里为什么拿了锁, 会死锁, 用读写锁解决这个问题吗?
+	//m.mu.Lock()
+	//defer m.mu.Unlock()
+	//根据当前的状态, 分配任务;
+	//TODO: 发现所有操作都一样，为什么不直接合并呢?
 	switch m.Status {
 	case MapStatus:
 		if len(m.MapChan) > 0 {
@@ -84,8 +89,42 @@ func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
 			reply.Type = SleepTask
 			reply.Id = 0
 		}
+	case ReduceStatus:
+		//操作流程通Map阶段,也是拿一个任务给他, 拿不出来就让它休息
+		if len(m.MapChan) > 0 {
+			//从里面拿一个任务给他
+			temp := <-m.MapChan
+			reply.Type = temp.Type
+			reply.Id = temp.Id
+			reply.Metadata = temp.Metadata
+			reply.NReduce = temp.NReduce
+			DPrintf(dLog, "master.RequestTask: task is %v", reply)
+			return nil
+		} else {
+			//如果拿不出来, 就可以通知work休息一会儿
+			reply.Type = SleepTask
+			reply.Id = 0
+		}
+	case DoneStatus:
+		//操作流程通Map阶段,也是拿一个任务给他, 拿不出来就让它休息
+		if len(m.MapChan) > 0 {
+			//从里面拿一个任务给他
+			temp := <-m.MapChan
+			reply.Type = temp.Type
+			reply.Id = temp.Id
+			reply.Metadata = temp.Metadata
+			reply.NReduce = temp.NReduce
+			DPrintf(dLog, "master.RequestTask: task is %v", reply)
+			return nil
+		} else {
+			//如果拿不出来, 就可以通知work休息一会儿
+			reply.Type = SleepTask
+			reply.Id = 0
+		}
 	default:
-		//TODO: Reduce和Done阶段都未实现
+		//默认就发Sleep
+		reply.Type = SleepTask
+		reply.Id = 0
 	}
 	DPrintf(dLog, "Master.RequestTask: task id is %d ", reply.Id)
 	return nil
@@ -155,18 +194,9 @@ func (m *Master) Done() bool {
 	//主进程周期性调用, 检查是否所有任务完成, 就是看状态是否是DoneStatus
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.Status == DoneStatus {
-		DPrintf(dLog, "master.Done: all done!")
+	if m.Status == ExitStatus {
+		DPrintf(dLog, "master.Done: All Map Reduce Task Finished, Master Exited!")
 		ret = true
-		//TODO: 这里是硬编码的3个, 后面看看怎么调整下
-		//TODO: 这样做其实有bug, 因为如果你client直接退出了, 会导致worker连接不上, 失败退出, 这里的机制其实没啥用
-		//通过往chan里放3个退出类型的task, 告诉worker要退出了, 不够优雅
-		for i := 0; i < 3; i++ {
-			task := &Task{
-				Type: ExitTask,
-			}
-			m.MapChan <- task
-		}
 	}
 	return ret
 }
@@ -178,6 +208,7 @@ func (m *Master) Done() bool {
 //
 func (m *Master) checkAllDone() {
 	//周期性检查是否所有任务都结束了
+	//TODO: 所有出口的Unlock, 能不能统一写一个defer Unlock
 	var err error
 	for err == nil {
 		DPrintf(dLog, "master.checkAllDone: start check done")
@@ -193,13 +224,65 @@ func (m *Master) checkAllDone() {
 		}
 		if nDone == true {
 			//表示都完成了
-			m.Status = DoneStatus
-			DPrintf(dLog, "checkAllDone: all task is done!!!!")
-			m.mu.Unlock()
-			break
+			m.convertToNextStatus()
+			DPrintf(dLog, "checkAllDone: all task is done!")
+			DPrintf(dLog, "checkAllDone: convert to next phase %v !", m.Status)
+			if m.Status == ExitStatus {
+				//只有是ExitStatus才可以退出
+				m.mu.Unlock()
+				break
+			}
 		}
 		m.cond.Wait()
 		m.mu.Unlock()
+	}
+}
+
+//
+// convertToNextStatus
+//  @Description: 从当前阶段转到下一个阶段, 并做下一个阶段开始的初始化工作
+//  @receiver m
+//
+func (m *Master) convertToNextStatus() {
+	//这里不需要加锁, 是因为外层已经加了锁
+	switch m.Status {
+	case MapStatus:
+		//下个阶段是ReduceStatus, 要放入NReduce个对应task
+		DPrintf(dLog, "master.convertToNextStatus: TaskList is %v", m.TaskList)
+		m.Status = ReduceStatus
+		for i := 0; i < m.NReduce; i++ {
+			task := &Task{
+				Type:     ReduceTask,
+				Id:       m.TaskId,
+				Metadata: "", //TODO: 这里的原数据还不清楚放什么
+				NReduce:  m.NReduce,
+				Done:     false,
+			}
+			m.TaskList = append(m.TaskList, *task)
+			m.MapChan <- task
+			m.TaskId++
+		}
+	case ReduceStatus:
+		//下一个阶段是DoneStatus, 所有的工作都结束了, 用ExitTask告诉Worker要退出了
+		m.Status = DoneStatus
+		//这里应该根据worker的个数, 放对应多个的task;
+		nworer := 3
+		for i := 0; i < nworer; i++ {
+			task := &Task{
+				Type:     ExitTask,
+				Id:       m.TaskId,
+				Metadata: "",
+				NReduce:  m.NReduce,
+				Done:     false,
+			}
+			m.TaskList = append(m.TaskList, *task)
+			m.MapChan <- task
+			m.TaskId++
+		}
+	case DoneStatus:
+		//下一个阶段是ExitStatus, 所有的Worker已经退出, 这里可以直接拜拜了
+		m.Status = ExitStatus
+	default:
 	}
 }
 
@@ -220,8 +303,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 	}
 	m.cond = sync.NewCond(&m.mu)
 	// Your code here.
-	// 按照输入的文件, 创建对应的Map任务;
-	//TODO: 后面还应该有Reduce任务
+	// 按照输入的文件, 创建对应的Map任务, Reduce任务放到下一个阶段去处理
 	for _, file := range files {
 		//每个文件, 创建一个Map任务
 		id := m.TaskId

@@ -50,12 +50,24 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Fatalln("worker.WorkMap task %d error %v", task.Id, err)
 			}
 			NotisfyMasterTaskDone(task, err)
+		case ReduceTask:
+			//处理Reduce任务, 处理完毕通知Master
+			err := WorkReduce(task)
+			if err != nil {
+				log.Fatalln("worker.WorkReduce task %d error %v", task.Id, err)
+			}
+			NotisfyMasterTaskDone(task, err)
 		case SleepTask:
 			//如果是SleepTask, 说明要休眠10min
 			time.Sleep(time.Second * 10)
 		case ExitTask:
 			//Master通知你要退出了
-			break
+			task.Done = true
+			var err error
+			NotisfyMasterTaskDone(task, err)
+			DPrintf(dWorker, "worker.Worker: work exit!!!")
+			//NOTE: 这里不能用break, 得用return
+			return
 		default:
 
 		}
@@ -178,9 +190,18 @@ func WorkMap(mapf func(string, string) []KeyValue, task *Task) error {
 	for _, kv := range intermediate {
 		hashkv[ihash(kv.Key)%nreduce] = append(hashkv[ihash(kv.Key)%nreduce], kv)
 	}
+	//jsonData, err := json.Marshal(hashkv)
+	//filename = "task" + strconv.Itoa(task.Id)
+	//err = ioutil.WriteFile(filename, jsonData, 0644)
+	//DPrintf(dMap, "worker.workMap: hashkv is written to file")
 	localCache = hashkv
 	task.Done = true
 	DPrintf(dMap, "worker.WorkMap: Task %d was Mapped!", task.Id)
+	return nil
+}
+
+func WorkReduce(task *Task) error {
+	task.Done = true
 	return nil
 }
 
