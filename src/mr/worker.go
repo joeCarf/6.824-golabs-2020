@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"runtime"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -36,21 +38,30 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
-	fmt.Println("worker.Worker: start request tast from master")
+	DPrintf(dLog, "worker.Worker: start request tast from master")
 	var err error
 	for err == nil {
 		task := RequestTaskFromMaster()
 		switch task.Type {
 		case MapTask:
-			WorkMap(mapf, task)
+			//处理Map任务, 处理完了通知Master
+			err := WorkMap(mapf, task)
+			if err != nil {
+				log.Fatalln("worker.WorkMap task %d error %v", task.Id, err)
+			}
+			NotisfyMasterTaskDone(task, err)
+		case SleepTask:
+			//如果是SleepTask, 说明要休眠10min
+			time.Sleep(time.Second * 10)
+		case ExitTask:
+			//Master通知你要退出了
+			break
 		default:
 
 		}
-
 	}
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
-
 }
 
 //
@@ -58,22 +69,32 @@ func Worker(mapf func(string, string) []KeyValue,
 //  @Description: 通过RPC调用Master的RequestTask方法
 //
 func RequestTaskFromMaster() *Task {
-	fmt.Println("worker.RequestTaskFromMaster: ")
+	DPrintf(dLog, "worker.RequestTaskFromMaster: send rpc")
 	var args TaskArgs
 	reply := TaskReply{}
-	err := call("Master.RequestTask", &args, &reply)
-	if err {
-		log.Fatalln("RequestTaskFromMaster Failed", err)
+	ok := call("Master.RequestTask", &args, &reply)
+	if !ok {
+		log.Fatalln("worker.RequestTaskFromMaster: rpc Failed")
 	}
-	return (*Task)(&reply)
+	DPrintf(dLog, "worker.RequestTaskFromMaster: reply is %v", reply)
+	return &Task{
+		Type:     reply.Type,
+		Id:       reply.Id,
+		Metadata: reply.Metadata,
+		NReduce:  reply.NReduce,
+		Done:     reply.Done,
+	}
 }
 
-func NotisfyMasterTaskDone() bool {
-	fmt.Println("worker.NotisfyMasterTaskDone: ")
-	var args TaskArgs
-	reply := TaskReply{}
-	ok := call("master.NotisfyDone", &args, &reply)
-	if ok {
+func NotisfyMasterTaskDone(task *Task, err error) bool {
+	DPrintf(dLog, "worker.NotisfyMasterTaskDone: send rpc")
+	args := NotisfyArgs{
+		Task: *task,
+		Err:  err,
+	}
+	var reply NotisfyReply
+	ok := call("Master.NotisfyDone", &args, &reply)
+	if !ok {
 		log.Fatalln("NotisfyMasterTaskDone Failed")
 	}
 	return ok
@@ -158,6 +179,27 @@ func WorkMap(mapf func(string, string) []KeyValue, task *Task) error {
 		hashkv[ihash(kv.Key)%nreduce] = append(hashkv[ihash(kv.Key)%nreduce], kv)
 	}
 	localCache = hashkv
-	fmt.Printf("worker.WorkMap: Task %d was Mapped!", task.Id)
+	task.Done = true
+	DPrintf(dMap, "worker.WorkMap: Task %d was Mapped!", task.Id)
 	return nil
+}
+
+//
+// getFuncName
+//  @Description: 根据调用栈, 拿到当前函数名
+//  @return string
+//
+func getFuncName() string {
+	pc, _, _, ok := runtime.Caller(1)
+	if !ok {
+		fmt.Println("No caller information")
+		return ""
+	}
+
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		fmt.Println("No func information")
+		return ""
+	}
+	return fn.Name()
 }

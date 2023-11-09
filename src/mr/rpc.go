@@ -14,8 +14,16 @@ import "strconv"
 // and reply for an RPC.
 //
 
+//RequestTask RPC
 type TaskArgs interface{}
 type TaskReply Task
+
+//Notisfy RPC
+type NotisfyArgs struct {
+	Task Task
+	Err  error
+}
+type NotisfyReply interface{}
 
 type ExampleArgs struct {
 	X int

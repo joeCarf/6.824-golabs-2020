@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"sync"
 )
@@ -16,6 +15,7 @@ type Task struct {
 	Id       int      //任务ID
 	Metadata string   //任务中要处理的元数据
 	NReduce  int      //nreduce
+	Done     bool     //标识任务是否完成
 }
 
 //任务类型
@@ -24,6 +24,8 @@ type TaskType int
 const (
 	MapTask TaskType = iota
 	ReduceTask
+	ExitTask
+	SleepTask
 )
 
 //定义RPC通信, worker从Master这里拿到task
@@ -35,7 +37,9 @@ type Master struct {
 	MapChan    chan *Task   //Map任务的通道
 	ReduceChan chan *Task   //Reduce任务的通道
 	NReduce    int          //reduce的个数
+	TaskList   []Task       //存储了所有task实例
 	mu         sync.Mutex   //锁Master实例, 防止竞争
+	cond       *sync.Cond   //条件变量, 保证访问Master互斥
 }
 type MasterStatus int
 
@@ -61,15 +65,55 @@ func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
 	case MapStatus:
 		if len(m.MapChan) > 0 {
 			//从里面拿一个任务给他
-			reply = (*TaskReply)(<-m.MapChan)
+			temp := <-m.MapChan
+			//NOTE: 这里不能创建新对象, 必须直接填充原对象
+			reply.Type = temp.Type
+			reply.Id = temp.Id
+			reply.Metadata = temp.Metadata
+			reply.NReduce = temp.NReduce
+			//reply = &TaskReply{
+			//	Type:     temp.Type,
+			//	Id:       temp.Id,
+			//	Metadata: temp.Metadata,
+			//	NReduce:  temp.NReduce,
+			//}
+			DPrintf(dLog, "master.RequestTask: task is %v", reply)
 			return nil
 		} else {
-			//TODO: 拿不出来怎么处理
+			//如果拿不出来, 就可以通知work休息一会儿
+			reply.Type = SleepTask
+			reply.Id = 0
 		}
 	default:
 		//TODO: Reduce和Done阶段都未实现
 	}
-	fmt.Println("Master.RequestTask: task id is : ", reply.Id)
+	DPrintf(dLog, "Master.RequestTask: task id is %d ", reply.Id)
+	return nil
+}
+
+//
+// NotisfyDone
+//  @Description: NotisfyDone的RPC Handler, 将对应的task设置为done
+//  @receiver m
+//  @param args
+//  @param reply
+//  @return error
+//
+func (m *Master) NotisfyDone(args *NotisfyArgs, reply *NotisfyReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	task := args.Task
+	err := args.Err
+	//检查task的状态是否完成
+	if task.Done && err == nil {
+		DPrintf(dLog, "Master.NotisfyDone: TaskList[%d] is Done!", task.Id-1)
+		m.TaskList[task.Id-1].Done = true
+		//NOTE: 两种实现,事件驱动和时间驱动, 这里是每次完成一个Map，都去检查一下是否都Done了, 也可以另起一个线程用条件变量去检查
+		m.cond.Broadcast()
+	} else {
+		//否则就是出了问题, Map没有成功, 需要重启找一个Woker去做
+		//TODO: 失败了重新放到chan里面
+	}
 	return nil
 }
 
@@ -97,7 +141,7 @@ func (m *Master) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
-	fmt.Println("Master.server: listen on ", sockname)
+	DPrintf(dLog, "Master.server: listen on %s", sockname)
 }
 
 //
@@ -108,8 +152,55 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
-	//只需要检查是否所有的task都完成了
+	//主进程周期性调用, 检查是否所有任务完成, 就是看状态是否是DoneStatus
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Status == DoneStatus {
+		DPrintf(dLog, "master.Done: all done!")
+		ret = true
+		//TODO: 这里是硬编码的3个, 后面看看怎么调整下
+		//TODO: 这样做其实有bug, 因为如果你client直接退出了, 会导致worker连接不上, 失败退出, 这里的机制其实没啥用
+		//通过往chan里放3个退出类型的task, 告诉worker要退出了, 不够优雅
+		for i := 0; i < 3; i++ {
+			task := &Task{
+				Type: ExitTask,
+			}
+			m.MapChan <- task
+		}
+	}
 	return ret
+}
+
+//
+// checkAllDone
+//  @Description: 周期性检查是否完成的线程
+//  @receiver m
+//
+func (m *Master) checkAllDone() {
+	//周期性检查是否所有任务都结束了
+	var err error
+	for err == nil {
+		DPrintf(dLog, "master.checkAllDone: start check done")
+		//检查一下tasklist, 是否所有的
+		nDone := true
+		m.mu.Lock()
+		for i, task := range m.TaskList {
+			if task.Done == false {
+				DPrintf(dLog, "master.checkAllDone: TaskList[%d] Done is false", i)
+				nDone = false
+				break
+			}
+		}
+		if nDone == true {
+			//表示都完成了
+			m.Status = DoneStatus
+			DPrintf(dLog, "checkAllDone: all task is done!!!!")
+			m.mu.Unlock()
+			break
+		}
+		m.cond.Wait()
+		m.mu.Unlock()
+	}
 }
 
 //
@@ -119,12 +210,15 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
-		TaskId:     0,
+		TaskId:     1,
 		Status:     MapStatus,
-		MapChan:    make(chan *Task, len(files)),
+		MapChan:    make(chan *Task, len(files)), //TODO: 这里也要改, 任务数量
 		ReduceChan: nil,
 		NReduce:    nReduce,
+		TaskList:   nil,
+		mu:         sync.Mutex{},
 	}
+	m.cond = sync.NewCond(&m.mu)
 	// Your code here.
 	// 按照输入的文件, 创建对应的Map任务;
 	//TODO: 后面还应该有Reduce任务
@@ -136,11 +230,14 @@ func MakeMaster(files []string, nReduce int) *Master {
 			Id:       id,
 			Metadata: file,
 			NReduce:  nReduce,
+			Done:     false,
 		}
-		// 放入Map任务管道
+		// 将任务放到缓存和Map任务管道
+		m.TaskList = append(m.TaskList, *task)
 		m.MapChan <- task
 		m.TaskId++
 	}
 	m.server()
+	go m.checkAllDone() //周期性检查是否都完成了
 	return &m
 }
