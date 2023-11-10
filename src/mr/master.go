@@ -42,7 +42,7 @@ type Master struct {
 	ReduceChan chan *Task   //Reduce任务的通道
 	NReduce    int          //reduce的个数
 	TaskList   []Task       //存储了所有task实例
-	mu         sync.Mutex   //锁Master实例, 防止竞争
+	mu         sync.RWMutex //读写锁Master实例, 防止竞争
 	cond       *sync.Cond   //条件变量, 保证访问Master互斥
 }
 type MasterStatus int
@@ -58,18 +58,21 @@ const (
 // Your code here -- RPC handlers for the worker to call.
 //
 // RequestTask
-//  @Description: RequestTask从chan中取出一个任务执行
+//  @Description: RequestTask从chan中取出一个任务执行, 这个是并发的,RPC是新开了协程执行的, 所以要考虑并发读写的问题
 //  @receiver m
 //  @param args
 //  @param reply
 //  @return error
 //
 func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
-	//TODO: 这里为什么拿了锁, 会死锁, 用读写锁解决这个问题吗?
+	//NOTE: 这里为什么拿了锁, 会死锁, 用读写锁解决这个问题吗? 问题不是锁, 是chan缓冲不足, 频繁的Request导致SleepTask塞满了chan, 导致的死锁
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	//m.mu.Lock()
 	//defer m.mu.Unlock()
 	//根据当前的状态, 分配任务;
 	//TODO: 发现所有操作都一样，为什么不直接合并呢?
+	//DPrintf(dLog, "master.RequestTask: current goroutine ID: %d", GetGoroutineID())
 	switch m.Status {
 	case MapStatus:
 		if len(m.MapChan) > 0 {
@@ -211,14 +214,14 @@ func (m *Master) Done() bool {
 //  @receiver m
 //
 func (m *Master) checkAllDone() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	//周期性检查是否所有任务都结束了
-	//TODO: 所有出口的Unlock, 能不能统一写一个defer Unlock
 	var err error
 	for err == nil {
 		DPrintf(dLog, "master.checkAllDone: start check done")
 		//检查一下tasklist, 是否所有的
 		nDone := true
-		m.mu.Lock()
 		for i, task := range m.TaskList {
 			if task.Done == false {
 				DPrintf(dLog, "master.checkAllDone: TaskList[%d] Done is false", i)
@@ -233,12 +236,10 @@ func (m *Master) checkAllDone() {
 			DPrintf(dLog, "checkAllDone: convert to next phase %v !", m.Status)
 			if m.Status == ExitStatus {
 				//只有是ExitStatus才可以退出
-				m.mu.Unlock()
 				break
 			}
 		}
 		m.cond.Wait()
-		m.mu.Unlock()
 	}
 }
 
@@ -252,7 +253,6 @@ func (m *Master) convertToNextStatus() {
 	switch m.Status {
 	case MapStatus:
 		//下个阶段是ReduceStatus, 要放入NReduce个对应task
-		DPrintf(dLog, "master.convertToNextStatus: TaskList is %v", m.TaskList)
 		m.Status = ReduceStatus
 		for i := 0; i < m.NReduce; i++ {
 			task := &Task{
@@ -270,7 +270,7 @@ func (m *Master) convertToNextStatus() {
 		//下一个阶段是DoneStatus, 所有的工作都结束了, 用ExitTask告诉Worker要退出了
 		m.Status = DoneStatus
 		//这里应该根据worker的个数, 放对应多个的task;
-		nworer := 3
+		nworer := 1
 		for i := 0; i < nworer; i++ {
 			task := &Task{
 				Type:     ExitTask,
@@ -321,14 +321,15 @@ func fillReduceTaskMetadata(i int) []string {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
+	nTask := len(files) + nReduce + 3 + 10 //任务总数, 包括files个Map, nReduce个Reduce, 3个Exit, 最后空出来10个预留给Sleep
 	m := Master{
 		TaskId:     1,
 		Status:     MapStatus,
-		MapChan:    make(chan *Task, len(files)), //TODO: 这里也要改, 任务数量
+		MapChan:    make(chan *Task, nTask),
 		ReduceChan: nil,
 		NReduce:    nReduce,
 		TaskList:   nil,
-		mu:         sync.Mutex{},
+		mu:         sync.RWMutex{},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	// Your code here.

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -66,4 +68,21 @@ func DPrintf(topic logTopic, format string, a ...interface{}) {
 		format = prefix + format
 		log.Printf(format, a...)
 	}
+}
+
+//
+// getGoroutineID
+//  @Description: debug用, 打印出当前函数的协程id
+//  @return int
+//
+func GetGoroutineID() int {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Parse the 4707 out of "goroutine 4707 ["
+	idField := strings.Fields(strings.TrimPrefix(string(buf[:n]), "goroutine "))[0]
+	id, err := strconv.Atoi(idField)
+	if err != nil {
+		panic(fmt.Sprintf("cannot get goroutine id: %v", err))
+	}
+	return id
 }

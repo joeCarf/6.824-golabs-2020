@@ -51,6 +51,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			err := WorkMap(mapf, task)
 			if err != nil {
 				log.Fatalln("worker.WorkMap task %d error %v", task.Id, err)
+				return
 			}
 			NotisfyMasterTaskDone(task, err)
 		case ReduceTask:
@@ -58,11 +59,12 @@ func Worker(mapf func(string, string) []KeyValue,
 			err := WorkReduce(reducef, task)
 			if err != nil {
 				log.Fatalln("worker.WorkReduce task %d error %v", task.Id, err)
+				return
 			}
 			NotisfyMasterTaskDone(task, err)
 		case SleepTask:
-			//如果是SleepTask, 说明要休眠10min
-			time.Sleep(time.Second * 10)
+			//如果是SleepTask, 说明要休眠10s
+			time.Sleep(time.Second * 1)
 		case ExitTask:
 			//Master通知你要退出了
 			task.Done = true
@@ -70,6 +72,8 @@ func Worker(mapf func(string, string) []KeyValue,
 			NotisfyMasterTaskDone(task, err)
 			DPrintf(dWorker, "worker.Worker: work exit!!!")
 			//NOTE: 这里不能用break, 得用return
+			//NOTE: Worker的退出机制有两种, 一种是RPC调用失败退出, 另一种是收到Master给他的ExitTask, 这种会有问题, master得准备N个ExitTask, 并且要等Worker们都拿到才能退出; 保证chan能访问到
+			//但是这个Worker的数量就得提前知道，他的每个test里面的worker数不一样的;
 			return
 		default:
 
