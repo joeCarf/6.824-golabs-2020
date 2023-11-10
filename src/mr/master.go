@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 import "net"
 import "os"
@@ -15,11 +16,12 @@ import "net/http"
 
 //===================定义Task====================//
 type Task struct {
-	Type     TaskType //任务类型
-	Id       int      //任务ID
-	Metadata []string //任务中要处理的元数据	TODO: 这里简单起见定义为了[]string, 是否可以通过某种编码, 让他既可以处理string又可以处理[]string;
-	NReduce  int      //nreduce
-	Done     bool     //标识任务是否完成
+	Type     TaskType  //任务类型
+	Id       int       //任务ID
+	Metadata []string  //任务中要处理的元数据	TODO: 这里简单起见定义为了[]string, 是否可以通过某种编码, 让他既可以处理string又可以处理[]string;
+	NReduce  int       //nreduce
+	Done     bool      //标识任务是否完成
+	DoneChan chan bool //与计时器一起实现超时处理
 }
 
 //任务类型
@@ -154,11 +156,12 @@ func (m *Master) NotisfyDone(args *NotisfyArgs, reply *NotisfyReply) error {
 	if task.Done && err == nil {
 		DPrintf(dLog, "Master.NotisfyDone: TaskList[%d] is Done!", task.Id-1)
 		m.TaskList[task.Id-1].Done = true
+		m.TaskList[task.Id-1].DoneChan <- true
 		//NOTE: 两种实现,事件驱动和时间驱动, 这里是每次完成一个Map，都去检查一下是否都Done了, 也可以另起一个线程用条件变量去检查
 		m.cond.Broadcast()
+
 	} else {
-		//否则就是出了问题, Map没有成功, 需要重启找一个Woker去做
-		//TODO: 失败了重新放到chan里面
+		//否则就是出了问题, Map没有成功, 需要重启找一个Woker去做, 这里由handlerTaskTimeout一起处理了, 所以这里什么都不做就行
 	}
 	return nil
 }
@@ -261,10 +264,13 @@ func (m *Master) convertToNextStatus() {
 				Metadata: fillReduceTaskMetadata(i),
 				NReduce:  m.NReduce,
 				Done:     false,
+				DoneChan: make(chan bool),
 			}
 			m.TaskList = append(m.TaskList, *task)
 			m.MapChan <- task
 			m.TaskId++
+			//要为每一个创建的交易, 建立一个监听超时的协程
+			go m.handlerTaskTimeout(*task)
 		}
 	case ReduceStatus:
 		//下一个阶段是DoneStatus, 所有的工作都结束了, 用ExitTask告诉Worker要退出了
@@ -278,10 +284,13 @@ func (m *Master) convertToNextStatus() {
 				Metadata: nil,
 				NReduce:  m.NReduce,
 				Done:     false,
+				DoneChan: make(chan bool),
 			}
 			m.TaskList = append(m.TaskList, *task)
 			m.MapChan <- task
 			m.TaskId++
+			//要为每一个创建的交易, 建立一个监听超时的协程
+			go m.handlerTaskTimeout(*task)
 		}
 	case DoneStatus:
 		//下一个阶段是ExitStatus, 所有的Worker已经退出, 这里可以直接拜拜了
@@ -316,6 +325,36 @@ func fillReduceTaskMetadata(i int) []string {
 }
 
 //
+// handlerTaskTimeout
+//  @Description: 专门用于, 处理一个task是否超时, 超时就重新发送这个任务
+//  @receiver m
+//  @param task
+//
+func (m *Master) handlerTaskTimeout(task Task) {
+	//这个要用一个for循环, 一直监听, 因为resent的也可能会失败
+	//访问chan是不需要加锁的
+	for {
+		select {
+		case <-m.TaskList[task.Id-1].DoneChan:
+			//说明处理完了
+			return
+		case <-time.After(time.Second * 10):
+			DPrintf(dLog, "master.handlerTaskTimeout: time out, task %d is resent!", task.Id)
+			//说明超时了, 超过10s没处理完, 重新发送一个task
+			newTask := &Task{
+				Type:     task.Type,
+				Id:       task.Id,
+				Metadata: task.Metadata,
+				NReduce:  task.NReduce,
+				Done:     false,
+				DoneChan: make(chan bool),
+			}
+			m.MapChan <- newTask
+		}
+	}
+}
+
+//
 // create a Master.
 // main/mrmaster.go calls this function.
 // nReduce is the number of reduce tasks to use.
@@ -343,11 +382,14 @@ func MakeMaster(files []string, nReduce int) *Master {
 			Metadata: []string{file},
 			NReduce:  nReduce,
 			Done:     false,
+			DoneChan: make(chan bool),
 		}
 		// 将任务放到缓存和Map任务管道
 		m.TaskList = append(m.TaskList, *task)
 		m.MapChan <- task
 		m.TaskId++
+		//要为每一个创建的交易, 建立一个监听超时的协程
+		go m.handlerTaskTimeout(*task)
 	}
 	m.server()
 	go m.checkAllDone() //周期性检查是否都完成了

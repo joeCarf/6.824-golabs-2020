@@ -207,10 +207,12 @@ func WorkMap(mapf func(string, string) []KeyValue, task *Task) error {
 			return err
 		}
 	}
+	// crash要求, 写入文件是原子的, 用writeAtomic来实现
 	for i, kv := range hashkv {
 		filename := filepath.Join(newDir, fmt.Sprintf("map_tmp_%d_%d", task.Id, i))
 		jsonData, err := json.Marshal(kv)
-		err = ioutil.WriteFile(filename, jsonData, 0644)
+		err = writeAtomic(filename, jsonData)
+		//err = ioutil.WriteFile(filename, jsonData, 0644)
 		if err != nil {
 			log.Fatalln("worker.WorkMap: write to fail failed", filename)
 		}
@@ -233,7 +235,8 @@ func WorkReduce(reducef func(string, []string) string, task *Task) error {
 	intermediate := Shuffle(task.Metadata)
 	// ==================mrsequential.go中的Reduce操作======================//
 	oname := fmt.Sprintf("mr-out-%d", task.Id%task.NReduce)
-	ofile, _ := os.Create(oname)
+	//ofile, _ := os.Create(oname)
+	var outputContent string
 	//
 	// call Reduce on each distinct key in intermediate[],
 	// and print the result to mr-out-0.
@@ -251,9 +254,14 @@ func WorkReduce(reducef func(string, []string) string, task *Task) error {
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		//fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		outputContent += fmt.Sprintf("%v %v\n", intermediate[i].Key, output)
 
 		i = j
+	}
+	if err := writeAtomic(oname, []byte(outputContent)); err != nil {
+		log.Fatalln("worker.WorkReduce: writeAtomic failed!")
+		return err
 	}
 	//============================================================================//
 	DPrintf(dReduce, "worker.WorkReduce: Task %d was Reduced to %v!", task.Id, oname)
@@ -308,4 +316,29 @@ func getFuncName() string {
 		return ""
 	}
 	return fn.Name()
+}
+
+//
+// writeAtomic
+//  @Description: 通过tempFile, 实现文件写入的原子操作
+//  @param filename
+//  @param data
+//  @return error
+//
+func writeAtomic(filename string, data []byte) error {
+	//创建临时文件
+	tempFile, err := ioutil.TempFile(filepath.Dir(filename), "temp")
+	//退出前保证关闭临时文件
+	defer tempFile.Close()
+	if err != nil {
+		log.Fatalln("open temp file error", err)
+		return err
+	}
+	//将数据写入临时文件
+	if _, err := tempFile.Write(data); err != nil {
+		return err
+	}
+	//将临时文件改为需要写入的文件
+	err = os.Rename(tempFile.Name(), filename)
+	return err
 }
