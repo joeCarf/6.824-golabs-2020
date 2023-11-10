@@ -1,8 +1,8 @@
 package mr
 
 import (
-	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -26,7 +26,7 @@ type Master struct {
 }
 
 type WorkingQueue struct {
-	Queue map[int]Task
+	Queue map[int]*Task
 	mu    sync.Mutex
 }
 
@@ -38,7 +38,7 @@ func (wq *WorkingQueue) removeTaskById(taskId int) {
 
 func (wq *WorkingQueue) putTask(taskId int, task Task) {
 	wq.mu.Lock()
-	wq.Queue[taskId] = task
+	wq.Queue[taskId] = &task
 	wq.mu.Unlock()
 }
 
@@ -64,6 +64,7 @@ const (
 	MapTask = iota
 	ReduceTask
 	None
+	Sleep
 )
 
 // Your code here -- RPC handlers for the worker to call.
@@ -93,7 +94,7 @@ func (m *Master) AskForTask(request *AskForTaskRequest, response *AskForTaskResp
 	}
 
 	response.Task = task
-	fmt.Println("the returned task is: ", response.Task)
+	//fmt.Println("the returned task is: ", response.Task)
 	return nil
 }
 
@@ -109,6 +110,7 @@ func (m *Master) NotifyTaskDone(
 
 	if m.WorkingStatus == Mapping && len(m.MapTaskChannel) == 0 && len(m.MapWorkingQueue.Queue) == 0 {
 		m.WorkingStatus = Reducing
+		m.prepareReducingTask()
 	} else if m.WorkingStatus == Reducing && len(m.ReduceTaskChannel) == 0 && len(m.ReduceWorkingQueue.Queue) == 0 {
 		m.WorkingStatus = Done
 	}
@@ -116,15 +118,34 @@ func (m *Master) NotifyTaskDone(
 	return nil
 }
 
+func (m *Master) prepareReducingTask() {
+	m.TaskIdMutex.Lock()
+	defer m.TaskIdMutex.Unlock()
+	if len(m.ReduceTaskChannel) > 0 {
+		return
+	}
+
+	for i := 0; i < m.NReduce; i++ {
+		var task = Task{FileName: strconv.Itoa(int(m.CurrentTaskId)), TaskId: int32(i)}
+		m.ReduceTaskChannel <- &task
+	}
+}
+
 func (m *Master) processMappingTask() (Task, error) {
-	fmt.Println("receive asked for mapping task from worker...")
+	//fmt.Println("receive asked for mapping task from worker...")
+	if len(m.MapTaskChannel) == 0 {
+		return Task{Type: Sleep}, nil
+	}
 	task := <-m.MapTaskChannel
-	(*task).TaskId = m.generateTaskId()
+	if (*task).TaskId == -1 && (*task).StartTime == -1 {
+		(*task).TaskId = m.generateTaskId()
+	}
 	(*task).StartTime = m.generateStartTime()
 	(*task).Type = MapTask
 	(*task).NReduce = m.NReduce
 
 	m.MapWorkingQueue.putTask(int((*task).TaskId), *task)
+	//fmt.Println("send back map task...", task)
 	return *task, nil
 }
 
@@ -145,9 +166,18 @@ func (m *Master) generateStartTime() int64 {
 }
 
 func (m *Master) processReducingTask() (Task, error) {
-	fmt.Println("receive asked for reducing task from worker...")
+	//fmt.Println("receive asked for reducing task from worker...")
+	if len(m.ReduceTaskChannel) == 0 {
+		return Task{Type: Sleep}, nil
+	}
+	task := <-m.ReduceTaskChannel
+	(*task).StartTime = m.generateStartTime()
+	(*task).Type = ReduceTask
+	(*task).NReduce = m.NReduce
 
-	return Task{Type: ReduceTask}, nil
+	m.ReduceWorkingQueue.putTask(int((*task).TaskId), *task)
+	//fmt.Println("send back reduce task...", task)
+	return *task, nil
 }
 
 //
@@ -183,6 +213,40 @@ func (m *Master) Done() bool {
 	return ret
 }
 
+func (m *Master) checkTaskList() {
+	for {
+		if m.WorkingStatus == Mapping {
+			if len(m.MapWorkingQueue.Queue) > 0 {
+				for _, task := range m.MapWorkingQueue.Queue {
+					cur := m.generateStartTime()
+					if cur-task.StartTime >= 10 {
+						//fmt.Println("[REPUT] taskid = ", task.TaskId, "  time: ", cur)
+						m.MapTaskChannel <- task
+						task.StartTime = cur
+					}
+				}
+			}
+
+		}
+		if m.WorkingStatus == Reducing {
+			if len(m.ReduceWorkingQueue.Queue) > 0 {
+				for _, task := range m.ReduceWorkingQueue.Queue {
+					cur := m.generateStartTime()
+					if cur-task.StartTime >= 10 {
+						m.ReduceTaskChannel <- task
+						//m.ReduceWorkingQueue.removeTaskById(id)
+						task.StartTime = cur
+					}
+				}
+			}
+		}
+		if m.WorkingStatus == Done {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 //
 // create a Master.
 // main/mrmaster.go calls this function.
@@ -194,10 +258,10 @@ func MakeMaster(files []string, nReduce int) *Master {
 		WorkingStatus: Mapping,
 		FileNames:     files,
 		MapWorkingQueue: WorkingQueue{
-			Queue: make(map[int]Task),
+			Queue: make(map[int]*Task),
 		},
 		ReduceWorkingQueue: WorkingQueue{
-			Queue: make(map[int]Task),
+			Queue: make(map[int]*Task),
 		},
 		CurrentTaskId:     0,
 		MapTaskChannel:    make(chan *Task, nMap),
@@ -206,9 +270,11 @@ func MakeMaster(files []string, nReduce int) *Master {
 	}
 
 	for _, file := range files {
-		var task = Task{FileName: file}
+		var task = Task{FileName: file, TaskId: -1, StartTime: -1}
 		m.MapTaskChannel <- &task
 	}
+
+	go m.checkTaskList()
 
 	// Your code here.
 

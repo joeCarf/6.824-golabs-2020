@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -18,6 +21,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 type AskForTaskRequest struct {
 }
@@ -46,6 +56,11 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func generateStartTime() int64 {
+	now := time.Now()
+	return now.Unix()
+}
+
 //
 // main/mrworker.go calls this function.
 //
@@ -56,13 +71,20 @@ func Worker(mapf func(string, string) []KeyValue,
 	for {
 		request := AskForTaskRequest{}
 		response := AskForTaskResponse{}
-		call("Master.AskForTask", &request, &response)
+		ok := call("Master.AskForTask", &request, &response)
+		if !ok {
+			time.Sleep(1 * time.Second)
+			continue
+		}
 		switch response.Task.Type {
 		case MapTask:
 			doMappingTask(mapf, &(response.Task))
 			sendTaskDoneMessage(int(response.Task.TaskId), MapTask)
 		case ReduceTask:
 			doReducingTask(reducef, &(response.Task))
+			sendTaskDoneMessage(int(response.Task.TaskId), ReduceTask)
+		case Sleep:
+			time.Sleep(500 * time.Millisecond)
 		case None:
 			return
 		}
@@ -74,6 +96,7 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func doMappingTask(mapf func(string, string) []KeyValue, task *Task) {
+	//fmt.Println("[MAP-Do-]", task.TaskId, " filename=", task.FileName, "======", os.Getpid(), "  time: ", generateStartTime())
 	intermediate := []KeyValue{}
 	filename := task.FileName
 	file, err := os.Open(filename)
@@ -106,11 +129,66 @@ func doMappingTask(mapf func(string, string) []KeyValue, task *Task) {
 			}
 		}
 	}
+	//fmt.Println("[MAP] map task done...filename=", task.FileName, "  taskid=", task.TaskId, "======", os.Getpid(), "  time: ", generateStartTime())
 
 }
 
 func doReducingTask(reducef func(string, []string) string, task *Task) {
-	fmt.Println("received reduce task is: ", task)
+	//fmt.Println("[REDUCING] doing reduce task...", task)
+
+	filenames := generateReducingFileList(task.FileName, task.TaskId)
+	intermediate := []KeyValue{}
+	for _, filename := range filenames {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+	}
+	sort.Sort(ByKey(intermediate))
+	var outputFileName string = "mr-out-" + strconv.Itoa(int(task.TaskId))
+	var outputContent string
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		//fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		outputContent += fmt.Sprintf("%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	if err := writeAtomic(outputFileName, []byte(outputContent)); err != nil {
+		log.Fatalln("worker.WorkReduce: writeAtomic failed!")
+	}
+
+	//fmt.Println("[REDUCING] reduce task done...", task)
+}
+
+func generateReducingFileList(maxMapTaskIdStr string, id int32) []string {
+	var filenameList []string
+	maxMapTaskId, _ := strconv.Atoi(maxMapTaskIdStr)
+	for i := 0; i < maxMapTaskId; i++ {
+		filename := intermediateFilePrefix + strconv.Itoa(i) + "-" + strconv.Itoa(int(id))
+		filenameList = append(filenameList, filename)
+	}
+	return filenameList
 }
 
 func sendTaskDoneMessage(taskId int, taskType TaskType) {
@@ -163,4 +241,22 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func writeAtomic(filename string, data []byte) error {
+	//创建临时文件
+	tempFile, err := ioutil.TempFile(filepath.Dir(filename), "temp")
+	//退出前保证关闭临时文件
+	defer tempFile.Close()
+	if err != nil {
+		log.Fatalln("open temp file error", err)
+		return err
+	}
+	//将数据写入临时文件
+	if _, err := tempFile.Write(data); err != nil {
+		return err
+	}
+	//将临时文件改为需要写入的文件
+	err = os.Rename(tempFile.Name(), filename)
+	return err
 }
