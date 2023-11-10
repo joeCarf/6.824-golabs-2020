@@ -1,7 +1,11 @@
 package mr
 
 import (
+	"fmt"
+	"io/ioutil"
 	"log"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 import "net"
@@ -13,7 +17,7 @@ import "net/http"
 type Task struct {
 	Type     TaskType //任务类型
 	Id       int      //任务ID
-	Metadata string   //任务中要处理的元数据
+	Metadata []string //任务中要处理的元数据	TODO: 这里简单起见定义为了[]string, 是否可以通过某种编码, 让他既可以处理string又可以处理[]string;
 	NReduce  int      //nreduce
 	Done     bool     //标识任务是否完成
 }
@@ -254,7 +258,7 @@ func (m *Master) convertToNextStatus() {
 			task := &Task{
 				Type:     ReduceTask,
 				Id:       m.TaskId,
-				Metadata: "", //TODO: 这里的原数据还不清楚放什么
+				Metadata: fillReduceTaskMetadata(i),
 				NReduce:  m.NReduce,
 				Done:     false,
 			}
@@ -271,7 +275,7 @@ func (m *Master) convertToNextStatus() {
 			task := &Task{
 				Type:     ExitTask,
 				Id:       m.TaskId,
-				Metadata: "",
+				Metadata: nil,
 				NReduce:  m.NReduce,
 				Done:     false,
 			}
@@ -284,6 +288,31 @@ func (m *Master) convertToNextStatus() {
 		m.Status = ExitStatus
 	default:
 	}
+}
+
+//
+// fillReduceTaskMetadata
+//  @Description: 填充ReduceTask的MetaData字段
+//  @param i	代表当前是第几个ReduceTask
+//  @return []string
+//
+func fillReduceTaskMetadata(i int) []string {
+	//根据文件名的最后一个字段分配reduce task
+	var ret []string
+	path, _ := os.Getwd()
+	dirPath := filepath.Join(path, "map-tmp")
+	//获取目录下所有文件
+	files, _ := ioutil.ReadDir(dirPath)
+	//构造后缀字符串
+	suffix := fmt.Sprintf("_%d", i)
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), suffix) {
+			//判断这个文件, 有i的后缀
+			filename := filepath.Join(dirPath, file.Name())
+			ret = append(ret, filename)
+		}
+	}
+	return ret
 }
 
 //
@@ -310,7 +339,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		task := &Task{
 			Type:     MapTask,
 			Id:       id,
-			Metadata: file,
+			Metadata: []string{file},
 			NReduce:  nReduce,
 			Done:     false,
 		}

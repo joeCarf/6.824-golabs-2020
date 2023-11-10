@@ -1,10 +1,13 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"time"
 )
 import "log"
@@ -52,7 +55,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			NotisfyMasterTaskDone(task, err)
 		case ReduceTask:
 			//处理Reduce任务, 处理完毕通知Master
-			err := WorkReduce(task)
+			err := WorkReduce(reducef, task)
 			if err != nil {
 				log.Fatalln("worker.WorkReduce task %d error %v", task.Id, err)
 			}
@@ -167,7 +170,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 //
 func WorkMap(mapf func(string, string) []KeyValue, task *Task) error {
 	//根据文件元数据拿到文件
-	filename := task.Metadata
+	filename := task.Metadata[0]
 	//和mrsequential.go中处理逻辑一样, 只是这里只处理一个文件
 	var intermediate []KeyValue
 	file, err := os.Open(filename)
@@ -190,19 +193,97 @@ func WorkMap(mapf func(string, string) []KeyValue, task *Task) error {
 	for _, kv := range intermediate {
 		hashkv[ihash(kv.Key)%nreduce] = append(hashkv[ihash(kv.Key)%nreduce], kv)
 	}
-	//jsonData, err := json.Marshal(hashkv)
-	//filename = "task" + strconv.Itoa(task.Id)
-	//err = ioutil.WriteFile(filename, jsonData, 0644)
+	// 将文件保存到./map-tmp目录下
+	path, err := os.Getwd()
+	newDir := filepath.Join(path, "map-tmp")
+	if _, err := os.Stat(newDir); os.IsNotExist(err) {
+		// 如果不存在，则创建目录
+		err := os.Mkdir(newDir, 0755)
+		if err != nil {
+			return err
+		}
+	}
+	for i, kv := range hashkv {
+		filename := filepath.Join(newDir, fmt.Sprintf("map_tmp_%d_%d", task.Id, i))
+		jsonData, err := json.Marshal(kv)
+		err = ioutil.WriteFile(filename, jsonData, 0644)
+		if err != nil {
+			log.Fatalln("worker.WorkMap: write to fail failed", filename)
+		}
+	}
 	//DPrintf(dMap, "worker.workMap: hashkv is written to file")
-	localCache = hashkv
+	//localCache = hashkv
 	task.Done = true
 	DPrintf(dMap, "worker.WorkMap: Task %d was Mapped!", task.Id)
 	return nil
 }
 
-func WorkReduce(task *Task) error {
+//
+// WorkReduce
+//  @Description: 实际执行Reduce的操作, 合并一位维切片里的值计算结果写入mr-tmp文件中
+//  @param reducef
+//  @param task
+//  @return error
+//
+func WorkReduce(reducef func(string, []string) string, task *Task) error {
+	intermediate := Shuffle(task.Metadata)
+	// ==================mrsequential.go中的Reduce操作======================//
+	oname := fmt.Sprintf("mr-out-%d", task.Id%task.NReduce)
+	ofile, _ := os.Create(oname)
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+	//============================================================================//
+	DPrintf(dReduce, "worker.WorkReduce: Task %d was Reduced to %v!", task.Id, oname)
 	task.Done = true
 	return nil
+}
+
+type ByKey []KeyValue
+
+//TODO: 没懂为什么不定义下面的方法就不行, 原来是如何运行的
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+//
+// Shuffle
+//  @Description: 根据给的所有文件，从中JSON读出[]KeyValue, 放到一个里面返回
+//  @param filePaths
+//  @return []KeyValue
+//
+func Shuffle(filePaths []string) []KeyValue {
+	var ret []KeyValue
+	for _, filePath := range filePaths {
+		fileData, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			log.Fatalf("worker.Shuffle: read file %v error %v", filePath, err)
+		}
+		var fileContent []KeyValue
+		_ = json.Unmarshal(fileData, &fileContent)
+		ret = append(ret, fileContent...)
+	}
+	//sort排好序
+	sort.Sort(ByKey(ret))
+	return ret
 }
 
 //
