@@ -38,14 +38,13 @@ const (
 
 type Master struct {
 	// Your definitions here.
-	TaskId     int          //当前任务的编号
-	Status     MasterStatus //当前所处的状态
-	MapChan    chan *Task   //Map任务的通道
-	ReduceChan chan *Task   //Reduce任务的通道
-	NReduce    int          //reduce的个数
-	TaskList   []Task       //存储了所有task实例
-	mu         sync.RWMutex //读写锁Master实例, 防止竞争
-	cond       *sync.Cond   //条件变量, 保证访问Master互斥
+	TaskId   int          //当前任务的编号
+	Status   MasterStatus //当前所处的状态
+	TaskChan chan *Task   //用来拿任务的chan
+	NReduce  int          //reduce的个数
+	TaskList []Task       //存储了所有task实例
+	mu       sync.RWMutex //读写锁Master实例, 防止竞争
+	cond     *sync.Cond   //条件变量, 保证访问Master互斥
 }
 type MasterStatus int
 
@@ -70,16 +69,14 @@ func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
 	//NOTE: 这里为什么拿了锁, 会死锁, 用读写锁解决这个问题吗? 问题不是锁, 是chan缓冲不足, 频繁的Request导致SleepTask塞满了chan, 导致的死锁
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	//m.mu.Lock()
-	//defer m.mu.Unlock()
 	//根据当前的状态, 分配任务;
 	//TODO: 发现所有操作都一样，为什么不直接合并呢?
 	//DPrintf(dLog, "master.RequestTask: current goroutine ID: %d", GetGoroutineID())
 	switch m.Status {
 	case MapStatus:
-		if len(m.MapChan) > 0 {
+		if len(m.TaskChan) > 0 {
 			//从里面拿一个任务给他
-			temp := <-m.MapChan
+			temp := <-m.TaskChan
 			//NOTE: 这里不能创建新对象, 必须直接填充原对象
 			reply.Type = temp.Type
 			reply.Id = temp.Id
@@ -100,9 +97,9 @@ func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
 		}
 	case ReduceStatus:
 		//操作流程通Map阶段,也是拿一个任务给他, 拿不出来就让它休息
-		if len(m.MapChan) > 0 {
+		if len(m.TaskChan) > 0 {
 			//从里面拿一个任务给他
-			temp := <-m.MapChan
+			temp := <-m.TaskChan
 			reply.Type = temp.Type
 			reply.Id = temp.Id
 			reply.Metadata = temp.Metadata
@@ -116,9 +113,9 @@ func (m *Master) RequestTask(args *TaskArgs, reply *TaskReply) error {
 		}
 	case DoneStatus:
 		//操作流程通Map阶段,也是拿一个任务给他, 拿不出来就让它休息
-		if len(m.MapChan) > 0 {
+		if len(m.TaskChan) > 0 {
 			//从里面拿一个任务给他
-			temp := <-m.MapChan
+			temp := <-m.TaskChan
 			reply.Type = temp.Type
 			reply.Id = temp.Id
 			reply.Metadata = temp.Metadata
@@ -157,7 +154,7 @@ func (m *Master) NotisfyDone(args *NotisfyArgs, reply *NotisfyReply) error {
 		DPrintf(dLog, "Master.NotisfyDone: TaskList[%d] is Done!", task.Id-1)
 		m.TaskList[task.Id-1].Done = true
 		m.TaskList[task.Id-1].DoneChan <- true
-		//NOTE: 两种实现,事件驱动和时间驱动, 这里是每次完成一个Map，都去检查一下是否都Done了, 也可以另起一个线程用条件变量去检查
+		//NOTE: 两种实现,事件驱动和时间驱动, 这里是每次完成一个Map，都去检查一下是否都Done
 		m.cond.Broadcast()
 
 	} else {
@@ -267,7 +264,7 @@ func (m *Master) convertToNextStatus() {
 				DoneChan: make(chan bool),
 			}
 			m.TaskList = append(m.TaskList, *task)
-			m.MapChan <- task
+			m.TaskChan <- task
 			m.TaskId++
 			//要为每一个创建的交易, 建立一个监听超时的协程
 			go m.handlerTaskTimeout(*task)
@@ -287,7 +284,7 @@ func (m *Master) convertToNextStatus() {
 				DoneChan: make(chan bool),
 			}
 			m.TaskList = append(m.TaskList, *task)
-			m.MapChan <- task
+			m.TaskChan <- task
 			m.TaskId++
 			//要为每一个创建的交易, 建立一个监听超时的协程
 			go m.handlerTaskTimeout(*task)
@@ -349,7 +346,7 @@ func (m *Master) handlerTaskTimeout(task Task) {
 				Done:     false,
 				DoneChan: make(chan bool),
 			}
-			m.MapChan <- newTask
+			m.TaskChan <- newTask
 		}
 	}
 }
@@ -362,13 +359,12 @@ func (m *Master) handlerTaskTimeout(task Task) {
 func MakeMaster(files []string, nReduce int) *Master {
 	nTask := len(files) + nReduce + 3 + 10 //任务总数, 包括files个Map, nReduce个Reduce, 3个Exit, 最后空出来10个预留给Sleep
 	m := Master{
-		TaskId:     1,
-		Status:     MapStatus,
-		MapChan:    make(chan *Task, nTask),
-		ReduceChan: nil,
-		NReduce:    nReduce,
-		TaskList:   nil,
-		mu:         sync.RWMutex{},
+		TaskId:   1,
+		Status:   MapStatus,
+		TaskChan: make(chan *Task, nTask),
+		NReduce:  nReduce,
+		TaskList: nil,
+		mu:       sync.RWMutex{},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	// Your code here.
@@ -386,7 +382,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 		}
 		// 将任务放到缓存和Map任务管道
 		m.TaskList = append(m.TaskList, *task)
-		m.MapChan <- task
+		m.TaskChan <- task
 		m.TaskId++
 		//要为每一个创建的交易, 建立一个监听超时的协程
 		go m.handlerTaskTimeout(*task)
