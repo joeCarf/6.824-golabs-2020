@@ -53,7 +53,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Fatalln("worker.WorkMap task %d error %v", task.Id, err)
 				return
 			}
-			NotisfyMasterTaskDone(task, err)
+			NotifyMasterTaskDone(task, err)
 		case ReduceTask:
 			//处理Reduce任务, 处理完毕通知Master
 			err := WorkReduce(reducef, task)
@@ -61,7 +61,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				log.Fatalln("worker.WorkReduce task %d error %v", task.Id, err)
 				return
 			}
-			NotisfyMasterTaskDone(task, err)
+			NotifyMasterTaskDone(task, err)
 		case SleepTask:
 			//如果是SleepTask, 说明要休眠10s
 			time.Sleep(time.Second * 1)
@@ -69,7 +69,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			//Master通知你要退出了
 			task.Done = true
 			var err error
-			NotisfyMasterTaskDone(task, err)
+			NotifyMasterTaskDone(task, err)
 			DPrintf(dWorker, "worker.Worker: work exit!!!")
 			//NOTE: 这里不能用break, 得用return
 			//NOTE: Worker的退出机制有两种, 一种是RPC调用失败退出, 另一种是收到Master给他的ExitTask, 这种会有问题, master得准备N个ExitTask, 并且要等Worker们都拿到才能退出; 保证chan能访问到
@@ -105,16 +105,16 @@ func RequestTaskFromMaster() *Task {
 	}
 }
 
-func NotisfyMasterTaskDone(task *Task, err error) bool {
-	DPrintf(dLog, "worker.NotisfyMasterTaskDone: send rpc")
-	args := NotisfyArgs{
+func NotifyMasterTaskDone(task *Task, err error) bool {
+	DPrintf(dLog, "worker.NotifyMasterTaskDone: send rpc")
+	args := NotifyArgs{
 		Task: *task,
 		Err:  err,
 	}
-	var reply NotisfyReply
-	ok := call("Master.NotisfyDone", &args, &reply)
+	var reply NotifyReply
+	ok := call("Master.NotifyDone", &args, &reply)
 	if !ok {
-		log.Fatalln("NotisfyMasterTaskDone Failed")
+		log.Fatalln("NotifyMasterTaskDone Failed")
 	}
 	return ok
 }
