@@ -18,12 +18,14 @@ import "strconv"
 type TaskArgs interface{}
 type TaskReply Task
 
+
 //Notify RPC
 type NotifyArgs struct {
 	Task Task
 	Err  error
 }
 type NotifyReply interface{}
+
 
 type ExampleArgs struct {
 	X int
