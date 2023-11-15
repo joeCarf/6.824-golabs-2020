@@ -14,7 +14,6 @@ import "os"
 import "net/rpc"
 import "net/http"
 
-
 const TimeOut = 10 * time.Second
 
 //===================定义Task====================//
@@ -78,14 +77,6 @@ const (
 
 type TaskArray struct {
 }
-type MasterStatus int
-
-const (
-	MapStatus MasterStatus = iota
-	ReduceStatus
-	DoneStatus
-	ExitStatus
-)
 
 //========================供worker调用的RPC处理方法=======================//
 // Your code here -- RPC handlers for the worker to call.
