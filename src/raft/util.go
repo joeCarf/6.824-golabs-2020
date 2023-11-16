@@ -33,6 +33,7 @@ const (
 	dCommit   logTopic = "COMT"
 	dPersist  logTopic = "PRST"
 	dSnapshot logTopic = "SNAP"
+	dTest     logTopic = "TEST"
 )
 
 var debugStart time.Time
@@ -57,7 +58,7 @@ func init() {
 //从环境变量里读到日志level
 func getVerboisty() int {
 	v := os.Getenv("VERBOSE")
-	level := 1
+	level := 0
 	if v != "" {
 		var err error
 		level, err = strconv.Atoi(v)

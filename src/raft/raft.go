@@ -406,7 +406,8 @@ func (rf *Raft) ticker() {
 			canElect := rf.state != LEADER
 			rf.mu.RUnlock()
 			if canElect {
-				rf.leaderElection()
+				//NOTE: 这里需要用另一个线程去执行, 因为如果这个过程耗时较长(比如rpc连不到,要等rpc返回值), 会导致ticker阻塞;
+				go rf.leaderElection()
 			}
 		case <-rf.heartbeatTimer.C:
 			// 发送心跳包计时器超时, 需要发送心跳包, 同样只有leader可以发心跳包
@@ -414,7 +415,7 @@ func (rf *Raft) ticker() {
 			canBroadHB := rf.state == LEADER
 			rf.mu.RUnlock()
 			if canBroadHB {
-				rf.broadcastHeartbeat()
+				go rf.broadcastHeartbeat()
 			}
 		}
 	}
