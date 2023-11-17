@@ -262,9 +262,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //  @receiver rf
 //
 func (rf *Raft) leaderElection() {
-	DPrintf(dTicker, "T%d: S%d ElectionTimer timeout, leader election started", rf.currentTerm, rf.me)
 	//转candidate需要遵守的规则: Increment currentTerm, Vote for myself, Reset election timers
 	rf.mu.Lock()
+	DPrintf(dTicker, "T%d: S%d ElectionTimer timeout, leader election started", rf.currentTerm, rf.me)
 	rf.state = CANDIDATE
 	rf.currentTerm++
 	rf.votedFor = rf.me
@@ -299,6 +299,14 @@ func (rf *Raft) leaderElection() {
 			if !ok {
 				//DPrintf(dVote, "T%d: S%d received no reply from S%d", rf.currentTerm, rf.me, peer)
 			}
+			//NOTE: 加了一个过期rpc的处理, 比如发现args.term已经小于currentTerm了, 说明这是个过期的, 直接忽略就好, 因为RPC处理过程肯定能长, 因为节点是会crash的
+			rf.mu.RLock()
+			if args.Term < rf.currentTerm {
+				DPrintf(dVote, "T%d: S%d <- S%d received expired rpc reply. [args.Term%d, currentTerm=%d]", rf.currentTerm, rf.me, peer, args.Term, rf.currentTerm)
+				rf.mu.RUnlock()
+				return
+			}
+			rf.mu.RUnlock()
 			leMutex.Lock()
 			if reply.VoteGranted == true {
 				getVotes++ // 如果投票给你, 得票数++
@@ -310,7 +318,8 @@ func (rf *Raft) leaderElection() {
 					rf.state = FOLLOWER
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
-					rf.electionTimer.Reset(rf.randomElectionTime())
+					//Student Guide里面说: 只有三个时机需要重置选举时间超时
+					//rf.electionTimer.Reset(rf.randomElectionTime())
 				}
 				rf.mu.Unlock()
 			}
@@ -323,18 +332,20 @@ func (rf *Raft) leaderElection() {
 	for getVotes <= len(rf.peers)/2 && finishVotes != len(rf.peers) {
 		condRV.Wait()
 	}
+	var retVotes = getVotes
 	leMutex.Unlock()
 	// 首先需要保证自己还是candicate, 因为在选举过程中可能会更新状态
 	rf.mu.Lock()
 	if rf.state == CANDIDATE {
 		//如果受到的选票过半, 说明可以转为leader
-		if getVotes > len(rf.peers)/2 {
+		if retVotes > len(rf.peers)/2 {
 			DPrintf(dVote, "T%d: S%d received majority votes, convert to leader", rf.currentTerm, rf.me)
 			rf.state = LEADER
 			//NOTE: 这里不可以重置选票, 成为leader之后没有投票权
 			//rf.votedFor = -1
-			rf.heartbeatTimer.Reset(rf.stableHeartbeatTime())
-			rf.broadcastHeartbeat() //发心跳包通知其他节点自己Leader的身份
+			//发心跳包通知其他节点自己Leader的身份
+			rf.heartbeatTimer.Reset(0 * time.Second)
+			//go rf.broadcastHeartbeat() //发心跳包通知其他节点自己Leader的身份
 		}
 		//就算失败, 也不需要额外做什么, 因为一个任期内只能选举一次, 失败了就等下一次
 	}
@@ -348,16 +359,18 @@ func (rf *Raft) leaderElection() {
 //  @receiver rf
 //
 func (rf *Raft) broadcastHeartbeat() {
+	rf.mu.RLock()
 	DPrintf(dTicker, "T%d: S%d HearBeatTimer timeout, broad heart beat started", rf.currentTerm, rf.me)
-	//需要重置心跳计时器
-	rf.heartbeatTimer.Reset(rf.stableHeartbeatTime())
+	rf.mu.RUnlock()
 	var bhbWg sync.WaitGroup
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
+		bhbWg.Add(1)
 		go func(peer int) {
-			bhbWg.Add(1)
+			//FIXME: 为什么这里放到外面, 就会死循环, 按理说就要放外面才对
+			//bhbWg.Add(1)
 			defer bhbWg.Done()
 			rf.mu.RLock()
 			args := AppendEntriesArgs{
@@ -371,6 +384,14 @@ func (rf *Raft) broadcastHeartbeat() {
 				//DPrintf(dAppend, "T%d: S%d received no reply from S%d", rf.currentTerm, rf.me, peer)
 				return
 			}
+			//NOTE: 加了一个过期rpc的处理, 比如发现args.term已经小于currentTerm了, 说明这是个过期的, 直接忽略就好, 因为RPC处理过程肯定能长, 因为节点是会crash的
+			rf.mu.RLock()
+			if args.Term < rf.currentTerm {
+				DPrintf(dAppend, "T%d: S%d <- S%d received expired rpc reply. [args.Term%d, currentTerm=%d]", rf.currentTerm, rf.me, peer, args.Term, rf.currentTerm)
+				rf.mu.RUnlock()
+				return
+			}
+			rf.mu.RUnlock()
 			//如果失败了, 说明对方的term更大, 需要更新状态为follower
 			rf.mu.Lock()
 			if reply.Success == false {
@@ -379,14 +400,14 @@ func (rf *Raft) broadcastHeartbeat() {
 					rf.state = FOLLOWER
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
-					rf.electionTimer.Reset(rf.randomElectionTime())
+					//rf.electionTimer.Reset(rf.randomElectionTime())
 				}
 			}
 			rf.mu.Unlock()
 		}(peer)
-		// 等待RPC都结束了再退出, 因为有可能会转变状态
-		bhbWg.Wait()
 	}
+	// 等待RPC都结束了再退出, 因为有可能会转变状态
+	bhbWg.Wait()
 }
 
 //====================重要的后台函数==========================//
@@ -409,6 +430,7 @@ func (rf *Raft) ticker() {
 				//NOTE: 这里需要用另一个线程去执行, 因为如果这个过程耗时较长(比如rpc连不到,要等rpc返回值), 会导致ticker阻塞;
 				go rf.leaderElection()
 			}
+			rf.electionTimer.Reset(rf.randomElectionTime()) //只要触发了, 就自动重置一次
 		case <-rf.heartbeatTimer.C:
 			// 发送心跳包计时器超时, 需要发送心跳包, 同样只有leader可以发心跳包
 			rf.mu.RLock()
@@ -417,6 +439,7 @@ func (rf *Raft) ticker() {
 			if canBroadHB {
 				go rf.broadcastHeartbeat()
 			}
+			rf.heartbeatTimer.Reset(rf.stableHeartbeatTime())
 		}
 	}
 }
@@ -429,7 +452,7 @@ func (rf *Raft) ticker() {
 //  @return time.Duration
 //
 func (rf *Raft) randomElectionTime() time.Duration {
-	ms := 300 + (rand.Int63() % 150)
+	ms := 600 + (rand.Int63() % 300)
 	return time.Duration(ms) * time.Millisecond
 }
 
@@ -440,7 +463,7 @@ func (rf *Raft) randomElectionTime() time.Duration {
 //  @return time.Duration
 //
 func (rf *Raft) stableHeartbeatTime() time.Duration {
-	ms := 50
+	ms := 150
 	return time.Duration(ms) * time.Millisecond
 }
 
